@@ -1,14 +1,26 @@
+"""
+Скрипт для верификации предсказаний TFT модели.
+Функция predict_next_close() берёт данные из тестового набора,
+подаёт на вход модели, получает предсказание и рассчитывает close цену.
+"""
+
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 
+# Пути к данным и модели
 DATA_PATH = "data/train_test.npz"
 MODEL_PATH = "data/best_model.pt"
 
 
+# ============ Архитектура модели TFT (та же что в train_tft.py) ============
+
+
 class GatedResidualNetwork(nn.Module):
+    """GRN - Gated Residual Network."""
+
     def __init__(self, d_model, d_ff=None, dropout=0.1, epsilon=1e-5):
         super().__init__()
         d_ff = d_ff or d_model * 4
@@ -27,6 +39,8 @@ class GatedResidualNetwork(nn.Module):
 
 
 class VariableSelectionNetwork(nn.Module):
+    """VSN - Variable Selection Network."""
+
     def __init__(self, n_features, d_model, dropout=0.1):
         super().__init__()
         self.feature_weights = nn.Sequential(
@@ -43,6 +57,8 @@ class VariableSelectionNetwork(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
+    """Positional Encoding для временных рядов."""
+
     def __init__(self, d_model, max_len=500):
         super().__init__()
         pe = torch.zeros(max_len, d_model)
@@ -59,6 +75,8 @@ class PositionalEncoding(nn.Module):
 
 
 class TemporalFusionTransformer(nn.Module):
+    """Temporal Fusion Transformer."""
+
     def __init__(
         self,
         n_features,
@@ -124,6 +142,19 @@ class TemporalFusionTransformer(nn.Module):
 
 
 def load_model_and_scaler(model_path, n_features, predict_len):
+    """
+    Загрузка обученной модели и скейлера из checkpoint.
+
+    Параметры:
+        model_path: путь к файлу модели
+        n_features: количество признаков
+        predict_len: горизонт предсказания
+
+    Возвращает:
+        model: загруженная модель
+        y_scaler: скейлер для обратного преобразования
+        device: устройство (GPU/CPU)
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = TemporalFusionTransformer(
         n_features=n_features,
@@ -138,6 +169,7 @@ def load_model_and_scaler(model_path, n_features, predict_len):
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
+    # Восстанавливаем параметры скейлера
     y_scaler = StandardScaler()
     y_scaler.mean_ = checkpoint["y_scaler_mean"]
     y_scaler.scale_ = checkpoint["y_scaler_scale"]
@@ -146,6 +178,30 @@ def load_model_and_scaler(model_path, n_features, predict_len):
 
 
 def predict_next_close(df_features, n_samples=None):
+    """
+    Функция для предсказания цены close с помощью TFT модели.
+
+    Алгоритм:
+    1. Берёт данные из тестового набора
+    2. Подаёт на вход модели
+    3. Получает предсказанную дельту
+    4. Рассчитывает close = current_close + predicted_delta
+
+    Параметры:
+        df_features: DataFrame с данными и признаками
+        n_samples: количество сэмплов для предсказания (None = все)
+
+    Возвращает:
+        DataFrame с результатами:
+        - sample: индекс сэмпла
+        - current_close: текущая цена close
+        - predicted_delta: предсказанное изменение
+        - actual_delta: реальное изменение
+        - predicted_close: рассчитанная цена close
+        - actual_close: реальная цена close
+        - direction_correct: правильность направления
+    """
+    # Загружаем тестовые данные
     data = np.load(DATA_PATH)
     X = data["X_test"]
     y_test = data["y_test"]
@@ -156,32 +212,43 @@ def predict_next_close(df_features, n_samples=None):
     if n_samples is None:
         n_samples = len(X)
 
+    # Загружаем модель и скейлер
     model, y_scaler, device = load_model_and_scaler(MODEL_PATH, n_features, predict_len)
 
+    # Масштабируем входные данные
     scaler = StandardScaler()
     X_flat = X.reshape(-1, n_features)
     scaler.fit(X_flat)
     X_scaled = scaler.transform(X_flat).reshape(X.shape)
 
+    # Предсказание батчем
     X_batch = torch.FloatTensor(X_scaled[:n_samples]).to(device)
 
     with torch.no_grad():
         pred_scaled = model(X_batch)[0].cpu().numpy()
 
+    # Обратное преобразование масштаба (дельта)
     pred_delta = y_scaler.inverse_transform(pred_scaled)
 
+    # Индекс начала тестовых данных в исходном DataFrame
     train_end_idx = len(df_features) - len(y_test)
 
+    # Формируем результаты
     results = []
     for i in range(n_samples):
+        # Текущая цена close
         current_close = df_features.iloc[train_end_idx + i]["Close"]
 
+        # Предсказанная дельта
         if predict_len == 1:
             delta = pred_delta[i, 0]
         else:
             delta = np.sum(pred_delta[i])
 
+        # Рассчитанная цена close = текущая + дельта
         predicted_close = current_close + delta
+
+        # Реальная дельта и цена
         actual_delta = y_test[i, 0]
         actual_close = current_close + actual_delta
 
@@ -203,16 +270,20 @@ def predict_next_close(df_features, n_samples=None):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
+    # Загружаем данные
     df = pd.read_csv("data/eurusd_features.csv", parse_dates=["Date"], index_col="Date")
 
     print("=" * 60)
     print("MODEL VERIFICATION - Predicted vs Actual Close Prices")
     print("=" * 60)
 
+    # Получаем результаты предсказаний
     results = predict_next_close(df)
 
+    # Выводим первые 20 результатов
     print(results.head(20).to_string(index=False))
 
+    # Сводка
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
@@ -223,8 +294,10 @@ if __name__ == "__main__":
         f"Mean Close Error:     {(results['predicted_close'] - results['actual_close']).abs().mean():.6f}"
     )
 
+    # Визуализация
     fig, axes = plt.subplots(2, 1, figsize=(14, 10))
 
+    # График 1: Actual vs Predicted Close
     ax1 = axes[0]
     ax1.plot(
         results["actual_close"].values, label="Actual Close", alpha=0.8, linewidth=1.5
@@ -241,6 +314,7 @@ if __name__ == "__main__":
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
+    # График 2: Прогрессия цен
     ax2 = axes[1]
     ax2.plot(
         results["current_close"].values,
